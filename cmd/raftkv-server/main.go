@@ -79,7 +79,7 @@ func run() error {
 	store := &storage.FileStore{Path: filepath.Join(*dataDirectory, "raft-state.json")}
 	node, err := raft.NewNode(raft.Config{
 		ID: raft.NodeID(*id), Members: members, HeartbeatInterval: *heartbeat,
-		Timeouts: raft.RandomTimeout{Min: *electionMin, Max: *electionMax, Source: random},
+		Timeouts:  raft.RandomTimeout{Min: *electionMin, Max: *electionMax, Source: random},
 		Transport: transport, StateMachine: machine, Store: store,
 		SnapshotThreshold: *snapshotEvery, MaxSnapshotBytes: *maxSnapshot,
 	}, time.Now())

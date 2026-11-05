@@ -1,99 +1,60 @@
 # raftkv
 
-`raftkv` is a portfolio project for learning how to build a fault-tolerant,
-replicated key-value store in Go. The consensus algorithm will be implemented
-in this repository rather than delegated to an existing Raft library.
+`raftkv` is an educational, fault-tolerant key-value store written in Go. It implements Raft directly, uses gRPC for peer and client traffic, and supports static three-node and five-node clusters. It is a portfolio implementation, not a production service.
 
-> Status: Raft leader election, log replication, durable state/restart
-> recovery, an in-memory key-value state machine, and gRPC peer/client
-> networking are implemented and tested. Snapshots and production hardening
-> remain planned.
+Implemented capabilities include leader election, replicated `Put`, `Get`, and `Delete`, durable term/vote/log/commit state, restart recovery, bounded retry deduplication, snapshots, log compaction, snapshot catch-up, and deterministic failure tests. `Get` deliberately goes through the replicated log for a simple linearizable read path.
 
-## Scope
+```text
+raftkvctl -> gRPC client service -> serialized node runtime -> Raft core
+                                                        |       |
+                                                        |       +-> peer gRPC
+                                                        +-> KV state machine
+                                                        +-> checksummed FileStore
+```
 
-The planned system has static three-node and five-node clusters, leader
-election, replicated logs, durable state, crash recovery, snapshots, and
-linearizable `Put`, `Get`, and `Delete` client operations. gRPC will carry peer
-and client traffic. A deterministic test harness and reproducible local demo
-will exercise failures.
-
-Dynamic membership, Kubernetes deployment, a web dashboard, and claims of
-production readiness are deliberately out of scope.
+The Raft core has no dependency on gRPC, wall-clock timers, or filesystem APIs. A runtime goroutine serializes real events; tests inject logical time, storage, and an in-memory network.
 
 ## Repository layout
 
 ```text
-api/raftkv/v1/       protobuf source (added with the transport stage)
-cmd/raftkv-server/   server executable
-cmd/raftkvctl/       command-line client
-internal/raft/       consensus state machine and log rules
-internal/storage/    durable Raft log, metadata, and snapshots
-internal/transport/  gRPC peer and client transport
-internal/kv/         deterministic key-value state machine
-internal/server/     process wiring and request coordination
-test/                deterministic integration and failure tests
-docs/                design and implementation progress
+api/raftkv/v1/       protobuf API and generated Go
+cmd/raftkv-server/   node executable
+cmd/raftkvctl/       retrying client CLI
+internal/raft/       consensus core, tests, randomized harness, benchmark
+internal/kv/         deterministic KV state machine and snapshot encoding
+internal/storage/    checksummed atomic-replacement stable store
+internal/transport/  gRPC peer transport and response capture
+internal/server/     serialized runtime and gRPC services
+scripts/             Windows local-cluster and integration scripts
+docs/                design, audit, evidence, and interview guide
 ```
 
-The Raft package currently contains election and replication through ordered
-state-machine application. See [`docs/design.md`](docs/design.md) for the
-implemented flow, client retry assumptions, planned boundaries, and
-invariants.
+## Setup and build
 
-## Module path
+The module path `github.com/yourusername/raftkv` is a documented placeholder and should be replaced before publication under a final repository URL.
 
-The module currently uses the documented placeholder
-`github.com/yourusername/raftkv`. Replace it with the final repository path
-before publishing or adding generated protobuf imports.
-
-## Prerequisites on Windows
-
-Install Go and Protocol Buffers with Windows Package Manager, then open a new
-PowerShell session:
+On Windows, install prerequisites and open a new PowerShell session:
 
 ```powershell
 winget install --id GoLang.Go -e
 winget install --id Google.Protobuf -e
+go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.12
+go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
 ```
 
-After Go is available, install the Go protobuf generators:
+Build and regenerate protobuf code:
 
 ```powershell
-go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
-go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
-```
-
-Ensure Go's binary directory is on `PATH` (normally `%USERPROFILE%\go\bin`),
-then verify:
-
-```powershell
-go version
-protoc --version
-protoc-gen-go --version
-protoc-gen-go-grpc --version
-```
-
-## Checks
-
-```powershell
-go fmt ./...
-go vet ./...
-go test ./... -count=1
-```
-
-## Protobuf generation
-
-```powershell
+go build -o bin/raftkv-server.exe ./cmd/raftkv-server
+go build -o bin/raftkvctl.exe ./cmd/raftkvctl
 protoc --go_out=. --go_opt=paths=source_relative `
   --go-grpc_out=. --go-grpc_opt=paths=source_relative `
   api/raftkv/v1/raftkv.proto
 ```
 
-The current generated files use `protoc` 36.2, `protoc-gen-go` 1.36.12, and
-`protoc-gen-go-grpc` 1.6.2. Runtime dependencies are gRPC-Go 1.85.0 and
-protobuf Go 1.36.12.
+The checked-in generated files use protobuf 36.2, `protoc-gen-go` 1.36.12, and `protoc-gen-go-grpc` 1.6.2. Runtime dependencies are pinned in `go.mod` and `go.sum`.
 
-## Local three-node demonstration
+## Three-node operation
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/start-cluster.ps1
@@ -102,28 +63,53 @@ bin/raftkvctl.exe -client-id demo -seq 2 get greeting
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/stop-cluster.ps1
 ```
 
-Nodes bind to `127.0.0.1:7001` through `127.0.0.1:7003` by default and use
-separate directories below `tmp/local-cluster`. Run the complete leader
-failure and restart scenario with:
+Nodes bind to `127.0.0.1:7001` through `:7003` and use separate directories under `tmp/local-cluster`. Run the leader-failure, replacement-leader, restart, and snapshot catch-up demonstration with:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/integration.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/integration.ps1 `
+  -BaseDirectory ./tmp/snapshot-integration
 ```
 
-This is a local demonstration. It uses plaintext insecure gRPC credentials and
-has no authentication, authorization, TLS, hostile-input hardening, or
-production deployment support.
+## Five-node operation
 
-## Client retries and timeouts
+Start five server processes with distinct IDs, listen addresses, and data directories and the same peer map:
 
-`raftkvctl` reuses connections, follows leader hints, and retries transient
-failures until its overall deadline. Every retry preserves the same client ID
-and sequence number. Supply a stable `-client-id` and increase `-seq` by one
-for each completed operation.
+```text
+n1=127.0.0.1:7001,n2=127.0.0.1:7002,n3=127.0.0.1:7003,n4=127.0.0.1:7004,n5=127.0.0.1:7005
+```
 
-An RPC timeout is ambiguous: the command may have committed even though its
-response was lost. The CLI reports that the outcome is unknown and prints the
-identity that must be retried. A timeout does not prove that a write failed.
+Run each as `raftkv-server -id nN -listen 127.0.0.1:700N -peers <map> -data-dir tmp/five/nN`. Five nodes tolerate two failures but require three mutually connected nodes to elect and commit.
 
-Completed work is tracked separately in [`docs/progress.md`](docs/progress.md).
+## Snapshots and restart
 
+The server defaults to compacting after 100 applied entries and accepts a bounded unary snapshot up to 2 MiB. Override `-snapshot-threshold` and `-max-snapshot-bytes`. Restart a node with the same identity, peer map, and data directory to restore its snapshot, committed suffix, and deduplication records. A follower behind the leader's compacted boundary receives `InstallSnapshot`, then resumes `AppendEntries`.
+
+Snapshots contain only committed, applied KV and deduplication state. They are persisted with the retained suffix in one complete-state replacement before the old prefix is discarded in memory. Transfer is a single unary RPC with no streaming or chunking.
+
+## Verification and benchmark
+
+```powershell
+gofmt -l .
+go vet ./...
+go test ./... -count=1
+$env:RAFTKV_RANDOMIZED='1'; $env:RAFTKV_SEEDS='101,202,303,404,505'
+go test ./internal/raft -run TestRandomizedFiveNodeSafetyAndRecovery -count=1 -v
+go test ./internal/raft -run '^$' -bench BenchmarkThreeNodeDurablePut `
+  -benchtime=20x -count=3 -benchmem
+go mod verify
+```
+
+See [docs/test-report.md](docs/test-report.md) for commands actually completed, measured results, source identity, and blocked checks. See [docs/correctness-audit.md](docs/correctness-audit.md) for the claim-by-claim audit.
+
+## Tradeoffs and limitations
+
+- Static membership; no joint consensus or membership changes.
+- Each safety-critical change rewrites and syncs the complete JSON state, which is simple but slow compared with a WAL and group commit.
+- Bounded deduplication assumes unique client IDs, monotonically increasing sequences, one outstanding request per client, and retry before eviction. It is not universal exactly-once delivery.
+- Timeouts are ambiguous: retry the same client ID and sequence.
+- `Get` consumes a log entry; there is no ReadIndex or lease-read optimization.
+- Unary snapshots are bounded and copied in memory; no streaming.
+- Plaintext loopback gRPC only: no TLS, authentication, authorization, hostile-input hardening, dynamic discovery, or production operations.
+- Deterministic and bounded history checks are testing evidence, not a formal proof of Raft safety or linearizability.
+
+Technical references are the extended Raft paper by Diego Ongaro and John Ousterhout, official Go documentation and memory model, and official gRPC Go and Protocol Buffers documentation.
