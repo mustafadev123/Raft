@@ -4,9 +4,10 @@
 replicated key-value store in Go. The consensus algorithm will be implemented
 in this repository rather than delegated to an existing Raft library.
 
-> Status: Raft leader election is implemented and deterministically tested.
-> Log replication, persistence, RPC adapters, key-value operations, recovery,
-> snapshots, and full failure testing remain planned.
+> Status: Raft leader election, log replication, durable state/restart
+> recovery, and an in-memory key-value state machine are implemented and
+> deterministically tested. RPC adapters, snapshots, and full system testing
+> remain planned.
 
 ## Scope
 
@@ -34,9 +35,10 @@ test/                deterministic integration and failure tests
 docs/                design and implementation progress
 ```
 
-The Raft package currently contains only the election stage. Other packages
-remain compiling placeholders. See [`docs/design.md`](docs/design.md) for the
-implemented flow, planned boundaries, and invariants.
+The Raft package currently contains election and replication through ordered
+state-machine application. See [`docs/design.md`](docs/design.md) for the
+implemented flow, client retry assumptions, planned boundaries, and
+invariants.
 
 ## Module path
 

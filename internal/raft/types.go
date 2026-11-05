@@ -31,11 +31,65 @@ func (r Role) String() string {
 	}
 }
 
-// LogPosition describes the last entry known to a node. Log replication is
-// intentionally outside this stage; elections need only this position.
+// LogPosition describes the last entry known to a node for vote freshness.
 type LogPosition struct {
 	Index uint64
 	Term  uint64
+}
+
+type Operation uint8
+
+const (
+	OperationNoop Operation = iota
+	OperationPut
+	OperationDelete
+	OperationGet
+)
+
+// Command is replicated as part of a log entry. ClientID and Sequence define
+// the bounded retry identity used by the state machine.
+type Command struct {
+	Operation Operation
+	ClientID  string
+	Sequence  uint64
+	Key       string
+	Value     string
+}
+
+type Entry struct {
+	Index   uint64
+	Term    uint64
+	Command Command
+}
+
+type Result struct {
+	Value string
+	Found bool
+	Error string
+}
+
+// StateMachine applies committed entries and optionally returns a cached
+// result for a previously applied client request.
+type StateMachine interface {
+	Apply(entry Entry) Result
+	CachedResult(clientID string, sequence uint64) (Result, bool)
+}
+
+// PersistentState is the safety-critical state that must survive restart.
+// CommitIndex is included so recovery applies only the known committed prefix.
+type PersistentState struct {
+	CurrentTerm uint64
+	VotedFor    NodeID
+	Log         []Entry
+	CommitIndex uint64
+}
+
+// StableStore is implemented by the storage package. Save must not return nil
+// until the supplied state has reached the implementation's durability
+// boundary.
+type StableStore interface {
+	Load() (state PersistentState, found bool, err error)
+	Save(state PersistentState) error
 }
 
 type RequestVoteRequest struct {
@@ -51,15 +105,23 @@ type RequestVoteResponse struct {
 	Election    uint64
 }
 
-// Heartbeat is the election-only subset of AppendEntries. Log replication
-// will replace this with the complete RPC in a later stage.
-type Heartbeat struct {
-	Term     uint64
-	LeaderID NodeID
+type AppendEntriesRequest struct {
+	Term         uint64
+	LeaderID     NodeID
+	PrevLogIndex uint64
+	PrevLogTerm  uint64
+	Entries      []Entry
+	LeaderCommit uint64
+	RequestID    uint64
 }
 
-type HeartbeatResponse struct {
-	Term uint64
+type AppendEntriesResponse struct {
+	Term          uint64
+	Success       bool
+	MatchIndex    uint64
+	ConflictIndex uint64
+	ConflictTerm  uint64
+	RequestID     uint64
 }
 
 type MessageType uint8
@@ -67,8 +129,8 @@ type MessageType uint8
 const (
 	MessageRequestVote MessageType = iota
 	MessageRequestVoteResponse
-	MessageHeartbeat
-	MessageHeartbeatResponse
+	MessageAppendEntries
+	MessageAppendEntriesResponse
 )
 
 // Message is the transport-neutral election envelope.
@@ -77,10 +139,10 @@ type Message struct {
 	To   NodeID
 	Type MessageType
 
-	RequestVote         RequestVoteRequest
-	RequestVoteResponse RequestVoteResponse
-	Heartbeat           Heartbeat
-	HeartbeatResponse   HeartbeatResponse
+	RequestVote           RequestVoteRequest
+	RequestVoteResponse   RequestVoteResponse
+	AppendEntries         AppendEntriesRequest
+	AppendEntriesResponse AppendEntriesResponse
 }
 
 // Transport accepts outbound messages. Implementations must honor ctx: it is
@@ -116,10 +178,13 @@ func (r RandomTimeout) ElectionTimeout() time.Duration {
 type Config struct {
 	ID                NodeID
 	Members           []NodeID
-	LastLog           LogPosition
 	HeartbeatInterval time.Duration
 	Timeouts          TimeoutSource
 	Transport         Transport
+	StateMachine      StateMachine
+	Store             StableStore
+	InitialTerm       uint64
+	InitialLog        []Entry
 }
 
 var (
@@ -138,4 +203,52 @@ type State struct {
 	ElectionDeadline time.Time
 	HeartbeatDue     time.Time
 	Votes            int
+	CommitIndex      uint64
+	LastApplied      uint64
+	Log              []Entry
+	NextIndex        map[NodeID]uint64
+	MatchIndex       map[NodeID]uint64
+}
+
+var (
+	ErrNotLeader      = errors.New("not raft leader")
+	ErrInvalidCommand = errors.New("invalid client command")
+	ErrRequestPending = errors.New("a different request is already pending for this client")
+	ErrStorageFault   = errors.New("raft storage fault")
+)
+
+// Proposal completes only after its entry is committed and applied, or when
+// leadership is lost before completion.
+type Proposal struct {
+	done   chan struct{}
+	result Result
+}
+
+func newProposal() *Proposal { return &Proposal{done: make(chan struct{})} }
+
+func completedProposal(result Result) *Proposal {
+	p := newProposal()
+	p.complete(result)
+	return p
+}
+
+func (p *Proposal) Done() <-chan struct{} { return p.done }
+
+func (p *Proposal) Result() (Result, bool) {
+	select {
+	case <-p.done:
+		return p.result, true
+	default:
+		return Result{}, false
+	}
+}
+
+func (p *Proposal) complete(result Result) {
+	select {
+	case <-p.done:
+		return
+	default:
+		p.result = result
+		close(p.done)
+	}
 }

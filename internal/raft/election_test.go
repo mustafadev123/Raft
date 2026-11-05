@@ -10,6 +10,10 @@ type fixedTimeout time.Duration
 
 func (f fixedTimeout) ElectionTimeout() time.Duration { return time.Duration(f) }
 
+type fixedRandomSource int64
+
+func (f fixedRandomSource) Int63n(n int64) int64 { return int64(f) % n }
+
 type queuedMessage struct {
 	ctx     context.Context
 	message Message
@@ -40,10 +44,15 @@ func (n *memoryNetwork) Send(ctx context.Context, message Message) error {
 
 func (n *memoryNetwork) addNode(t *testing.T, id NodeID, members []NodeID, timeout time.Duration, lastLog LogPosition) *Node {
 	t.Helper()
+	initialLog := make([]Entry, lastLog.Index)
+	for i := range initialLog {
+		initialLog[i] = Entry{Index: uint64(i + 1), Term: lastLog.Term, Command: Command{Operation: OperationNoop}}
+	}
 	node, err := NewNode(Config{
 		ID:                id,
 		Members:           members,
-		LastLog:           lastLog,
+		InitialTerm:       lastLog.Term,
+		InitialLog:        initialLog,
 		HeartbeatInterval: 5 * time.Millisecond,
 		Timeouts:          fixedTimeout(timeout),
 		Transport:         n,
@@ -187,8 +196,8 @@ func TestNodesStepDownOnHigherTerm(t *testing.T) {
 	}
 
 	err := nodes["a"].Step(Message{
-		From: "b", To: "a", Type: MessageHeartbeatResponse,
-		HeartbeatResponse: HeartbeatResponse{Term: 7},
+		From: "b", To: "a", Type: MessageAppendEntriesResponse,
+		AppendEntriesResponse: AppendEntriesResponse{Term: 7},
 	}, network.now)
 	if err != nil {
 		t.Fatal(err)
@@ -241,7 +250,7 @@ func TestElectionDeadlineResetsOnlyForGrantedVoteOrHeartbeat(t *testing.T) {
 	network.advance(time.Millisecond)
 	_ = node.Step(Message{
 		From: "a", To: "b", Type: MessageRequestVote,
-		RequestVote: RequestVoteRequest{Term: 1, CandidateID: "a", LastLog: LogPosition{Index: 9, Term: 1}, Election: 1},
+		RequestVote: RequestVoteRequest{Term: 2, CandidateID: "a", LastLog: LogPosition{Index: 9, Term: 1}, Election: 1},
 	}, network.now)
 	if got := node.State().ElectionDeadline; !got.Equal(original) {
 		t.Fatalf("denied vote reset deadline to %v; want %v", got, original)
@@ -250,10 +259,62 @@ func TestElectionDeadlineResetsOnlyForGrantedVoteOrHeartbeat(t *testing.T) {
 	network.advance(time.Millisecond)
 	_ = node.Step(Message{
 		From: "a", To: "b", Type: MessageRequestVote,
-		RequestVote: RequestVoteRequest{Term: 1, CandidateID: "a", LastLog: LogPosition{Index: 5, Term: 2}, Election: 1},
+		RequestVote: RequestVoteRequest{Term: 2, CandidateID: "a", LastLog: LogPosition{Index: 5, Term: 2}, Election: 1},
 	}, network.now)
 	if got := node.State().ElectionDeadline; !got.Equal(network.now.Add(20 * time.Millisecond)) {
 		t.Fatalf("granted vote deadline = %v, want reset from now", got)
+	}
+
+	network.advance(time.Millisecond)
+	_ = node.Step(Message{
+		From: "c", To: "b", Type: MessageAppendEntries,
+		AppendEntries: AppendEntriesRequest{Term: 2, LeaderID: "c"},
+	}, network.now)
+	afterHeartbeat := network.now.Add(20 * time.Millisecond)
+	if got := node.State().ElectionDeadline; !got.Equal(afterHeartbeat) {
+		t.Fatalf("accepted heartbeat deadline = %v, want %v", got, afterHeartbeat)
+	}
+
+	network.advance(time.Millisecond)
+	_ = node.Step(Message{
+		From: "c", To: "b", Type: MessageAppendEntries,
+		AppendEntries: AppendEntriesRequest{Term: 1, LeaderID: "c"},
+	}, network.now)
+	if got := node.State().ElectionDeadline; !got.Equal(afterHeartbeat) {
+		t.Fatalf("stale heartbeat reset deadline to %v; want %v", got, afterHeartbeat)
+	}
+}
+
+func TestLeaderSendsPeriodicHeartbeats(t *testing.T) {
+	network, nodes := newThreeNodeCluster(t, nil)
+	network.advance(10 * time.Millisecond)
+	network.tick("a")
+	network.deliverAll()
+	if nodes["a"].State().Role != Leader {
+		t.Fatal("a did not become leader")
+	}
+
+	network.advance(4 * time.Millisecond)
+	network.tick("a")
+	if len(network.queue) != 0 {
+		t.Fatalf("messages before heartbeat deadline = %d, want 0", len(network.queue))
+	}
+
+	network.advance(time.Millisecond)
+	network.tick("a")
+	if len(network.queue) != 2 {
+		t.Fatalf("messages at heartbeat deadline = %d, want one per peer", len(network.queue))
+	}
+}
+
+func TestRandomTimeoutUsesInjectedRandomness(t *testing.T) {
+	timeouts := RandomTimeout{
+		Min:    100 * time.Millisecond,
+		Max:    200 * time.Millisecond,
+		Source: fixedRandomSource(37 * time.Millisecond),
+	}
+	if got, want := timeouts.ElectionTimeout(), 137*time.Millisecond; got != want {
+		t.Fatalf("ElectionTimeout() = %v, want %v", got, want)
 	}
 }
 

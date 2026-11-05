@@ -20,17 +20,49 @@
   delivery and partitions.
 - Added election tests for single-node and three-node elections, leader
   replacement, minority isolation, stale logs, higher terms, timer reset
-  rules, and delayed earlier-election responses.
+  rules, periodic heartbeats, injected timeout randomness, and delayed
+  earlier-election responses.
+- Implemented in-memory Raft log entries, AppendEntries consistency checks,
+  conflict repair, and per-follower `nextIndex`/`matchIndex` tracking.
+- Implemented majority commit advancement with the current-term restriction,
+  leader no-op entries, and ordered single-application tracking.
+- Implemented in-memory replicated `Put`, `Delete`, and log-based `Get`
+  commands with responses after commitment and application.
+- Implemented bounded deterministic retry deduplication using replicated
+  client IDs and monotonic request sequence numbers.
+- Added controlled replication tests for successful writes, isolated leaders,
+  conflicting suffix repair, in-memory leader changes, retries, committed
+  reads, ordered application, duplicate/delayed RPCs, and committed-entry
+  protection.
+- Added a versioned, checksummed whole-state file storing term, vote, log, and
+  commit index through synced temporary files and atomic replacement.
+- Integrated persistence barriers before vote responses, replication success,
+  outbound replication of local entries, state-machine application, and client
+  acknowledgment.
+- Implemented restart recovery that replays only the committed prefix and
+  reconstructs KV data and bounded request-deduplication records.
+- Added in-memory save-failure injection and filesystem crash hooks around the
+  temporary-write, sync, and replacement boundaries.
+- Added tests for vote recovery, follower catch-up after restart, immediate
+  full-cluster restart after an acknowledged write, uncommitted suffixes,
+  unsafe-ack prevention, corrupt/incomplete state, and crash generations.
 
 ## Current limitations
 
-- Only Raft leader election is implemented; log replication and commitment are
-  not.
-- No storage format or crash recovery is implemented.
+- Raft election and in-memory log replication are implemented, but snapshots
+  and log compaction are not.
+- Persistence rewrites and syncs the complete log for each safety-critical
+  change; no WAL, batching, snapshots, or compaction exists.
 - No protobuf schema, generated code, or gRPC dependency is present.
-- No key-value operations are implemented.
-- The deterministic harness currently covers election tests only; there is no
-  executable local cluster demo.
+- KV state and deduplication records are rebuilt from the committed log rather
+  than stored as a separate snapshot.
+- Retry deduplication is bounded and assumes unique client IDs, sequences that
+  begin at one and increase by one, one outstanding request per client, and
+  retries within the cache retention window. It is not universal exactly-once
+  delivery.
+- `Get` is replicated through the log; no optimized read path exists.
+- The deterministic harness covers election and replication tests, but there
+  is no executable local cluster demo.
 - The module path is a placeholder.
 - The race detector could not run in the current Windows toolchain because Go
   reported that `-race` requires CGO and `CGO_ENABLED=1`.
@@ -38,6 +70,6 @@
 ## Next step
 
 Do not extend the implementation until the next stage is requested. The next
-logical stage is Raft log replication and commitment, followed separately by
-durable storage and recovery.
+logical stage is gRPC transport; snapshots and log compaction remain separate
+future stages.
 
