@@ -1,7 +1,7 @@
 # Design
 
-This document describes the intended architecture. Except for the package and
-executable skeleton, these capabilities are plans rather than completed work.
+This document describes both the implemented leader-election stage and the
+intended architecture. Sections explicitly marked planned are not completed.
 
 ## Architecture
 
@@ -19,6 +19,31 @@ leader, and coordinate lifecycle and recovery.
 
 Cluster configuration is static and supplied at startup. Only three-node and
 five-node configurations are in scope; membership changes are not.
+
+## Leader election (implemented)
+
+Each node is a caller-serialized state machine. Its owner advances a supplied
+logical time with `Tick` and delivers one transport-neutral message at a time
+with `Step`. The core starts no goroutines, reads no wall clock, opens no
+network connection, and accesses no disk.
+
+A follower whose randomized election deadline expires increments its term,
+becomes a candidate, votes for itself, and sends vote requests to its fixed
+peers. A candidate becomes leader after votes from a majority, including its
+own vote. Becoming leader sends an immediate heartbeat; later ticks send
+periodic heartbeats. A valid heartbeat returns candidates and leaders to the
+follower role and resets the election deadline.
+
+Vote recipients compare last-log term first and then last-log index. They
+grant at most one candidate per term and reset their timer only for a granted
+vote. Any higher observed term clears the recorded vote and forces follower
+state. Election requests carry a cancellation context and generation number:
+queued requests can be canceled, while a response that was already produced
+is ignored unless it belongs to the candidate's current term and generation.
+
+The in-memory test transport queues messages and lets tests explicitly delay,
+drop, partition, or deliver them. Logical time and fixed timeout sources make
+the scenarios deterministic without sleep-based synchronization.
 
 ## Planned Raft invariants
 
@@ -54,6 +79,15 @@ snapshot metadata. Startup will load the latest valid snapshot, replay the
 remaining committed log, and resume without violating persisted voting and
 log promises. The on-disk format and atomic update strategy will be chosen in
 the storage stage and tested with injected failures.
+
+Current terms and votes exist only in memory. Disk durability and crash
+recovery are not implemented in the election stage.
+
+## Replication and client operations (planned)
+
+Election heartbeats currently model only the empty, leadership-establishing
+part of AppendEntries. Replicated log entries, commitment, and client-facing
+`Put`, `Get`, and `Delete` operations are not implemented.
 
 ## Testing strategy (planned)
 

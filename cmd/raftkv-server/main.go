@@ -10,4 +10,3 @@ import "fmt"
 func main() {
 	fmt.Println("raftkv-server: not implemented")
 }
-

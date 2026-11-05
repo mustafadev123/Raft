@@ -6,4 +6,3 @@ import "fmt"
 func main() {
 	fmt.Println("raftkvctl: not implemented")
 }
-
