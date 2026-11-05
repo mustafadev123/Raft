@@ -1,0 +1,15 @@
+# Go build and test output
+/bin/
+*.test
+*.out
+coverage.*
+
+# Local runtime data
+/data/
+/tmp/
+
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
