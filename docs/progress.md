@@ -15,7 +15,7 @@
 
 ## Verification status
 
-Exact local commands, durations, seeds, source fingerprint, raw benchmark samples, and blocked checks are in `docs/test-report.md`. Local Windows race testing remains blocked by `CGO_ENABLED=0` and no C compiler. A Linux CI workflow contains a race command, but the workflow definition is not a completed result.
+Exact local commands, durations, seeds, source fingerprint, raw benchmark samples, and blocked checks are in `docs/test-report.md`. Local Windows race testing remains blocked by `CGO_ENABLED=0`, no C compiler, and WDAC. GitHub Actions successfully completed Linux formatting/vet/unit/race, Windows real-process integration, and the separately dispatched five-node randomized workflow on reviewed commit `a7b6ee6e46537a35cec9abcebe06a011cbd9bec8`.
 
 ## Current limitations
 
@@ -26,9 +26,9 @@ Exact local commands, durations, seeds, source fingerprint, raw benchmark sample
 - `Get` is replicated through the log; there is no optimized read protocol.
 - No TLS, authentication, authorization, dynamic membership, Kubernetes, dashboard, online backup, or production-hardening claim.
 - The history checker explores at most eight completed operations and omits incomplete operations. A pass covers only the explored completed subhistory; timed-out outcomes remain unknown.
-- Local race verification is blocked and completed CI evidence is pending.
+- Local race verification is blocked; Linux CI race verification passed on the reviewed implementation commit.
 - The Go module path remains a publication placeholder.
 
 ## Next steps
 
-No new feature is requested in this stage. Before public publication, replace the placeholder module path, obtain completed Linux race/CI evidence for the exact reviewed source, and confirm that the documented filesystem assumptions match the intended deployment.
+No new feature is requested in this stage. Before broader publication, replace the placeholder module path and confirm that the documented filesystem assumptions match the intended deployment.

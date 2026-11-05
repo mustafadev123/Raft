@@ -4,8 +4,8 @@ Date: 2026-11-05 (America/New_York). Commands ran from the repository root in Wi
 
 ## Source identity
 
-- HEAD: `fa3c0b5466821681b83a02108ed7443f26a593f7` (`bully_algo_implemented`).
-- Worktree: dirty. Documentation files and a formatting-only change to `cmd/raftkv-server/main.go` are uncommitted. HEAD alone does not identify this tested source.
+- Reviewed implementation commit: `a7b6ee6e46537a35cec9abcebe06a011cbd9bec8` (`final_Commit`). This commit contains the audited documentation and formatting-only server change and was pushed to `origin/master`.
+- The content fingerprint below identifies the pre-commit reviewed file content independently of Git metadata.
 - Reproducible content fingerprint (SHA-256 over sorted `path<TAB>file-SHA256` records for all non-ignored source files except this report): `d44854c056fc87610094d6f45a78e733e2e7448699d769187d486c8b69da2f08`.
 - Ignored `bin/` and `tmp/` artifacts are excluded from the fingerprint.
 
@@ -68,11 +68,13 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/integration.ps1 
   -BaseDirectory ./tmp/final-integration
 ```
 
-Outcome: blocked/failed after 4,553 ms. Windows Application Control blocked the newly built `raftkvctl.exe`; the Go build also encountered cache access denial. The script stopped all three processes gracefully. This final-source process check is not passed.
+Local outcome: blocked/failed after 4,553 ms. Windows Application Control blocked the newly built `raftkvctl.exe`; the Go build also encountered cache access denial. The script stopped all three processes gracefully. This local process check is not passed.
 
 Follow-up diagnostics identified Code Integrity events 3033/3077 for policy ID `0283ac0f-fff1-49ae-ada1-8a933130cad6`: the generated executable did not meet enterprise signing requirements. The file has no `Zone.Identifier` alternate stream, so `Unblock-File` cannot resolve it. The active system state reports `VerifiedAndReputablePolicyState=1`, and the matching compiled policy is installed under the Windows Code Integrity policy directory. This is a machine-wide WDAC/Smart App Control restriction, not a repository permission setting. WSL, Docker, Podman, GCC, Clang, and MSVC were not installed, so no existing alternate execution environment was available.
 
 Prior local evidence from this audit session, before the formatting-only server change, completed the same script in 10.2 s: leader `n2` was stopped, `n3` replaced it, reads returned `one` and `two`, the old node restarted and caught up through snapshot/log state, and all nodes stopped gracefully. This is reported as prior evidence, not as a successful final rerun.
+
+GitHub Actions subsequently ran the Windows `process-integration` job successfully on exact commit `a7b6ee6e46537a35cec9abcebe06a011cbd9bec8`: <https://github.com/mustafadev123/Raft/actions/runs/41976647097/job/127076940894>.
 
 ## Race testing and CI
 
@@ -84,7 +86,9 @@ Outcome: blocked in 30 ms with `go: -race requires cgo; enable cgo by setting CG
 
 Installing a Windows C compiler alone would not complete this check because WDAC also rejects the unsigned Go-generated test executable. Safe remedies are: run the existing Linux CI workflow, use an installed Linux/WSL environment, or have the machine administrator deploy a scoped WDAC supplemental allow policy/enterprise signing rule for this development workspace. Disabling Smart App Control globally was not performed because it is a machine-wide security reduction and can be irreversible without a Windows reset/reinstall.
 
-`.github/workflows/ci.yml` defines an Ubuntu `go test -race ./internal/... -count=1` job and a Windows integration job. `.github/workflows/randomized.yml` defines manually dispatched fixed-seed testing. A workflow definition is not execution evidence. No completed run for this exact dirty source was accessible, so race verification is pending CI.
+Local race testing remains blocked. GitHub Actions ran the Ubuntu `unit` job successfully on exact commit `a7b6ee6e46537a35cec9abcebe06a011cbd9bec8`; that job executed formatting, vet, unit tests, and `go test -race ./internal/... -count=1`: <https://github.com/mustafadev123/Raft/actions/runs/41976647097/job/127076941111>. The complete CI run is <https://github.com/mustafadev123/Raft/actions/runs/41976647097>.
+
+The separately dispatched five-node randomized workflow also passed on that commit with seeds `1000` through `1099`: <https://github.com/mustafadev123/Raft/actions/runs/41976874658>.
 
 ## Generated code and dependencies
 
@@ -137,4 +141,4 @@ Measured latency mean: 13,450,677 ns/op (13.451 ms/op); median: 13,530,685 ns/op
 
 Passed locally: formatting, vet, compiled unit/deterministic packages, 100 seeded randomized scenarios, protobuf reproducibility, module checksum verification, module-graph listing, repository-content scans, and the durable benchmark.
 
-Blocked/pending: direct aggregate `go test ./...`, final real-process rerun, local race detector, and completed CI evidence for this exact source. The prior process integration success remains useful but does not replace a final-source pass.
+Blocked locally: direct aggregate `go test ./...`, final real-process rerun, and the local race detector because of Windows WDAC/Smart App Control and unavailable CGO. Remote verification passed on the exact reviewed implementation commit: Linux formatting/vet/unit/race, Windows real-process integration, and the fixed-seed five-node randomized workflow.

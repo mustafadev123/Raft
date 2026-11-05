@@ -48,7 +48,7 @@ Reasoning: inbound handlers register response captures before submitting seriali
 
 Tested: `TestDuplicateRPCResponseWaitersAreNotOverwritten` is the targeted regression test for the discovered overwrite/leak defect. The real-process integration covers graceful shutdown and restart.
 
-Unresolved limitation: `GRPC.Close` waits on a `sync.WaitGroup`; correctness relies on server/runtime shutdown ordering preventing new `Send` calls from racing with `Close`. There is no dedicated concurrent close/send stress test, and local race execution is blocked. A completed Linux race CI run is pending.
+Unresolved limitation: `GRPC.Close` waits on a `sync.WaitGroup`; correctness relies on server/runtime shutdown ordering preventing new `Send` calls from racing with `Close`. There is no dedicated concurrent close/send stress test. Local race execution is blocked, although the configured Linux race suite passed on reviewed commit `a7b6ee6e46537a35cec9abcebe06a011cbd9bec8`.
 
 ## Overall conclusion
 
