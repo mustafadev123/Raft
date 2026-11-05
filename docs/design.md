@@ -14,9 +14,9 @@ core makes election and partition tests reproducible.
 `internal/storage` owns durable Raft metadata and log entries; snapshots remain
 planned.
 Durability must complete before dependent messages or acknowledgements are
-emitted. `internal/transport` will adapt generated gRPC services to Raft
-events. `internal/kv` will deterministically apply committed commands.
-`internal/server` will wire these parts together, route client requests to the
+emitted. `internal/transport` adapts generated gRPC services to Raft events.
+`internal/kv` deterministically applies committed commands.
+`internal/server` wires these parts together, routes client requests to the
 leader, and coordinate lifecycle and recovery.
 
 Cluster configuration is static and supplied at startup. Only three-node and
@@ -114,10 +114,38 @@ outstanding rule and retry within the configured retention window.
 - Snapshot installation preserves the term/index boundary and never rolls the
   state machine or commit index backward.
 
-## Client transport semantics (planned)
+## gRPC transport and process runtime (implemented)
 
-The core rejects proposals on followers, but no network client API or leader
-hint exists yet. Those semantics will be defined with the gRPC transport.
+The protobuf API defines RequestVote, AppendEntries, and client `Put`, `Get`,
+and `Delete` unary RPCs. The in-memory transport remains unchanged for
+deterministic tests.
+
+One runtime goroutine owns each Raft node and serializes ticks, inbound peer
+messages, state inspection, and proposals. gRPC handlers submit events and
+wait for results; they never mutate consensus state directly. The peer
+transport returns immediately from `Send`, performs bounded RPCs in separate
+goroutines, reuses one `ClientConn` per peer, and posts responses back to the
+runtime. Network failures are logged and drive ordinary Raft timeout behavior
+rather than crashing the runtime or unrelated goroutines.
+
+Peer handlers register a short-lived response capture before submitting an
+RPC to the core. The response emitted by the core after its persistence
+barrier becomes the unary gRPC response, preserving the deterministic core's
+ordering.
+
+Client RPCs return structured not-leader responses with the latest known
+leader address. The CLI reuses connections, follows hints, and retries with an
+unchanged client ID and sequence. Per-attempt and overall deadlines are
+bounded. Deadline expiration is an unknown outcome because an entry may have
+committed while its response was lost; safe retry uses the same identity.
+
+The node executable accepts node ID, loopback listen address, static peer
+address map, and data directory settings. JSON logs identify node, term, role,
+leader, commit index, and significant runtime/network events. Shutdown first
+uses gRPC graceful stop and then forces stop after a bounded wait.
+
+The demonstration uses plaintext insecure transport credentials and has no
+TLS, authentication, or authorization. It is intended only for loopback use.
 
 ## Persistence and recovery (implemented, without snapshots)
 

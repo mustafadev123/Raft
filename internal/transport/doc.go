@@ -1,2 +1,2 @@
-// Package transport will provide gRPC communication for peers and clients.
+// Package transport provides gRPC communication for Raft peers.
 package transport

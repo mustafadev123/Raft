@@ -46,6 +46,19 @@
 - Added tests for vote recovery, follower catch-up after restart, immediate
   full-cluster restart after an acknowledged write, uncommitted suffixes,
   unsafe-ack prevention, corrupt/incomplete state, and crash generations.
+- Added protobuf definitions and generated Go stubs for RequestVote,
+  AppendEntries, Put, Get, and Delete using the installed compatible toolchain.
+- Added a serialized real-time node runtime and asynchronous gRPC peer
+  transport with bounded deadlines, cancellation, reusable connections, and
+  isolated transport failures.
+- Added a configurable node executable, retrying CLI with stable request
+  identity, leader hints, ambiguous-timeout reporting, structured JSON logs,
+  and bounded graceful shutdown.
+- Added PowerShell start/stop and real-process integration scripts using three
+  loopback nodes and separate durable data directories.
+- Ran the process scenario through writes/reads, leader termination,
+  replacement election, another write/read, old-leader restart, catch-up, and
+  graceful cluster shutdown.
 
 ## Current limitations
 
@@ -53,7 +66,8 @@
   and log compaction are not.
 - Persistence rewrites and syncs the complete log for each safety-critical
   change; no WAL, batching, snapshots, or compaction exists.
-- No protobuf schema, generated code, or gRPC dependency is present.
+- The gRPC demonstration is plaintext loopback-only and has no TLS,
+  authentication, or authorization.
 - KV state and deduplication records are rebuilt from the committed log rather
   than stored as a separate snapshot.
 - Retry deduplication is bounded and assumes unique client IDs, sequences that
@@ -61,15 +75,14 @@
   retries within the cache retention window. It is not universal exactly-once
   delivery.
 - `Get` is replicated through the log; no optimized read path exists.
-- The deterministic harness covers election and replication tests, but there
-  is no executable local cluster demo.
+- The executable cluster is a local demonstration, not a production service.
 - The module path is a placeholder.
 - The race detector could not run in the current Windows toolchain because Go
   reported that `-race` requires CGO and `CGO_ENABLED=1`.
 
 ## Next step
 
-Do not extend the implementation until the next stage is requested. The next
-logical stage is gRPC transport; snapshots and log compaction remain separate
+Do not extend the implementation until the next stage is requested. Snapshots,
+log compaction, authentication/TLS, and production hardening remain separate
 future stages.
 

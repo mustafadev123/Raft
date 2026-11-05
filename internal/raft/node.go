@@ -16,8 +16,10 @@ type Node struct {
 	role      Role
 	term      uint64
 	votedFor  NodeID
+	leaderID  NodeID
 	lastLog   LogPosition
 	log       []Entry
+	snapshot  Snapshot
 
 	timeouts          TimeoutSource
 	heartbeatInterval time.Duration
@@ -25,6 +27,8 @@ type Node struct {
 	stateMachine      StateMachine
 	store             StableStore
 	storageErr        error
+	snapshotThreshold uint64
+	maxSnapshotBytes  int
 	electionDeadline  time.Time
 	heartbeatDue      time.Time
 
@@ -72,6 +76,7 @@ func NewNode(config Config, now time.Time) (*Node, error) {
 	currentTerm := config.InitialTerm
 	votedFor := NodeID("")
 	commitIndex := uint64(0)
+	snapshot := Snapshot{}
 	if config.Store != nil {
 		stored, found, err := config.Store.Load()
 		if err != nil {
@@ -85,6 +90,7 @@ func NewNode(config Config, now time.Time) (*Node, error) {
 			currentTerm = stored.CurrentTerm
 			votedFor = stored.VotedFor
 			commitIndex = stored.CommitIndex
+			snapshot = cloneSnapshot(stored.Snapshot)
 			if votedFor != "" {
 				if _, known := memberSet[votedFor]; !known {
 					return nil, fmt.Errorf("%w: stored vote for unknown member %q", ErrInvalidConfig, votedFor)
@@ -93,14 +99,15 @@ func NewNode(config Config, now time.Time) (*Node, error) {
 		}
 	}
 	for i, entry := range logCopy {
-		if entry.Index != uint64(i+1) || entry.Term == 0 || entry.Term > currentTerm {
+		if entry.Index != snapshot.LastIncludedIndex+uint64(i)+1 || entry.Term == 0 || entry.Term > currentTerm {
 			return nil, fmt.Errorf("%w: initial log must be contiguous and no newer than current term", ErrInvalidConfig)
 		}
 	}
-	if commitIndex > uint64(len(logCopy)) {
+	lastIndex := snapshot.LastIncludedIndex + uint64(len(logCopy))
+	if commitIndex < snapshot.LastIncludedIndex || commitIndex > lastIndex {
 		return nil, fmt.Errorf("%w: stored commit index exceeds log", ErrInvalidConfig)
 	}
-	lastLog := LogPosition{}
+	lastLog := LogPosition{Index: snapshot.LastIncludedIndex, Term: snapshot.LastIncludedTerm}
 	if len(logCopy) > 0 {
 		last := logCopy[len(logCopy)-1]
 		lastLog = LogPosition{Index: last.Index, Term: last.Term}
@@ -109,10 +116,29 @@ func NewNode(config Config, now time.Time) (*Node, error) {
 	n := &Node{
 		id: config.ID, members: members, memberSet: memberSet,
 		majority: len(members)/2 + 1, role: Follower, term: currentTerm, votedFor: votedFor,
-		lastLog: lastLog, log: logCopy, commitIndex: commitIndex,
+		lastLog: lastLog, log: logCopy, snapshot: snapshot, commitIndex: commitIndex,
 		timeouts: config.Timeouts, heartbeatInterval: config.HeartbeatInterval,
 		transport: config.Transport, stateMachine: config.StateMachine, store: config.Store,
+		snapshotThreshold: config.SnapshotThreshold, maxSnapshotBytes: config.MaxSnapshotBytes,
 		pending: make(map[string]pendingRequest),
+	}
+	if n.maxSnapshotBytes <= 0 {
+		n.maxSnapshotBytes = 4 << 20
+	}
+	if snapshot.LastIncludedIndex > 0 {
+		if len(snapshot.Data) > n.maxSnapshotBytes {
+			return nil, fmt.Errorf("%w: stored snapshot is %d bytes", ErrSnapshotTooLarge, len(snapshot.Data))
+		}
+		if n.stateMachine == nil {
+			return nil, fmt.Errorf("%w: snapshot requires a state machine", ErrInvalidConfig)
+		}
+		if err := n.stateMachine.ValidateSnapshot(snapshot.Data); err != nil {
+			return nil, fmt.Errorf("validate stored snapshot: %w", err)
+		}
+		if err := n.stateMachine.RestoreSnapshot(snapshot.Data); err != nil {
+			return nil, fmt.Errorf("restore stored snapshot: %w", err)
+		}
+		n.lastApplied = snapshot.LastIncludedIndex
 	}
 	n.resetElectionDeadline(now)
 	n.applyCommitted()
@@ -121,10 +147,11 @@ func NewNode(config Config, now time.Time) (*Node, error) {
 
 func (n *Node) State() State {
 	return State{
-		ID: n.id, Role: n.role, Term: n.term, VotedFor: n.votedFor, LastLog: n.lastLog,
+		ID: n.id, Role: n.role, Term: n.term, VotedFor: n.votedFor, LeaderID: n.leaderID, LastLog: n.lastLog,
 		Election: n.election, ElectionDeadline: n.electionDeadline, HeartbeatDue: n.heartbeatDue,
 		Votes: len(n.votes), CommitIndex: n.commitIndex, LastApplied: n.lastApplied,
 		Log: cloneEntries(n.log), NextIndex: copyProgress(n.nextIndex), MatchIndex: copyProgress(n.matchIndex),
+		LastIncludedIndex: n.snapshot.LastIncludedIndex, LastIncludedTerm: n.snapshot.LastIncludedTerm,
 	}
 }
 
@@ -162,6 +189,45 @@ func (n *Node) Propose(command Command) (*Proposal, error) {
 	return proposal, nil
 }
 
+// Compact snapshots the fully applied committed prefix. The state file is
+// durably replaced before the in-memory log prefix is removed.
+func (n *Node) Compact() error {
+	if err := n.ensureHealthy(); err != nil {
+		return err
+	}
+	if n.stateMachine == nil || n.lastApplied <= n.snapshot.LastIncludedIndex {
+		return nil
+	}
+	boundary := n.lastApplied
+	term := n.termAt(boundary)
+	data, err := n.stateMachine.Snapshot()
+	if err != nil {
+		return fmt.Errorf("create state-machine snapshot: %w", err)
+	}
+	if len(data) > n.maxSnapshotBytes {
+		return fmt.Errorf("%w: %d > %d bytes", ErrSnapshotTooLarge, len(data), n.maxSnapshotBytes)
+	}
+	newSnapshot := Snapshot{LastIncludedIndex: boundary, LastIncludedTerm: term, Data: append([]byte(nil), data...)}
+	newLog := cloneEntries(n.logFrom(boundary + 1))
+	state := n.persistentState()
+	state.Snapshot = newSnapshot
+	state.Log = newLog
+	if err := n.savePersistentState(state); err != nil {
+		return err
+	}
+	n.snapshot = newSnapshot
+	n.log = newLog
+	n.updateLastLog()
+	return nil
+}
+
+func (n *Node) MaybeCompact() error {
+	if n.snapshotThreshold == 0 || n.lastApplied-n.snapshot.LastIncludedIndex < n.snapshotThreshold {
+		return nil
+	}
+	return n.Compact()
+}
+
 func (n *Node) Tick(now time.Time) error {
 	if err := n.ensureHealthy(); err != nil {
 		return err
@@ -195,6 +261,10 @@ func (n *Node) Step(message Message, now time.Time) error {
 		return n.handleAppendEntries(message, now)
 	case MessageAppendEntriesResponse:
 		return n.handleAppendEntriesResponse(message)
+	case MessageInstallSnapshot:
+		return n.handleInstallSnapshot(message, now)
+	case MessageInstallSnapshotResponse:
+		return n.handleInstallSnapshotResponse(message)
 	default:
 		return fmt.Errorf("unknown message type %d", message.Type)
 	}
@@ -204,6 +274,7 @@ func (n *Node) startElection(now time.Time) error {
 	n.cancelCurrentElection()
 	n.cancelCurrentLeadership(Result{Error: ErrNotLeader.Error()})
 	n.role = Candidate
+	n.leaderID = ""
 	n.term++
 	n.votedFor = n.id
 	n.election++
@@ -277,10 +348,16 @@ func (n *Node) handleAppendEntries(message Message, now time.Time) error {
 		return nil
 	}
 	n.becomeFollowerSameTerm()
+	n.leaderID = request.LeaderID
 	n.resetElectionDeadline(now)
 
-	if request.PrevLogIndex > uint64(len(n.log)) {
-		response.ConflictIndex = uint64(len(n.log)) + 1
+	if request.PrevLogIndex < n.snapshot.LastIncludedIndex {
+		response.ConflictIndex = n.snapshot.LastIncludedIndex + 1
+		n.sendAppendResponse(message.From, response)
+		return nil
+	}
+	if request.PrevLogIndex > n.lastLogIndex() {
+		response.ConflictIndex = n.lastLogIndex() + 1
 		n.sendAppendResponse(message.From, response)
 		return nil
 	}
@@ -299,16 +376,19 @@ func (n *Node) handleAppendEntries(message Message, now time.Time) error {
 			n.sendAppendResponse(message.From, response)
 			return nil
 		}
-		if index <= uint64(len(n.log)) && n.termAt(index) != incoming.Term {
+		if index <= n.snapshot.LastIncludedIndex {
+			continue
+		}
+		if index <= n.lastLogIndex() && n.termAt(index) != incoming.Term {
 			if index <= n.commitIndex {
 				response.ConflictIndex = n.commitIndex + 1
 				n.sendAppendResponse(message.From, response)
 				return nil
 			}
-			n.log = n.log[:index-1]
+			n.log = n.log[:index-n.snapshot.LastIncludedIndex-1]
 			persistentChanged = true
 		}
-		if index > uint64(len(n.log)) {
+		if index > n.lastLogIndex() {
 			n.log = append(n.log, cloneEntries(request.Entries[i:])...)
 			persistentChanged = true
 			break
@@ -316,7 +396,7 @@ func (n *Node) handleAppendEntries(message Message, now time.Time) error {
 	}
 	n.updateLastLog()
 	if request.LeaderCommit > n.commitIndex {
-		n.commitIndex = min(request.LeaderCommit, uint64(len(n.log)))
+		n.commitIndex = min(request.LeaderCommit, n.lastLogIndex())
 		persistentChanged = true
 	}
 	if persistentChanged {
@@ -359,7 +439,7 @@ func (n *Node) handleAppendEntriesResponse(message Message) error {
 	if next == 0 {
 		next = 1
 	}
-	if ceiling := uint64(len(n.log)) + 1; next > ceiling {
+	if ceiling := n.lastLogIndex() + 1; next > ceiling {
 		next = ceiling
 	}
 	n.nextIndex[peer] = next
@@ -367,16 +447,109 @@ func (n *Node) handleAppendEntriesResponse(message Message) error {
 	return nil
 }
 
+func (n *Node) handleInstallSnapshot(message Message, now time.Time) error {
+	request := message.InstallSnapshot
+	if request.Term > n.term {
+		if err := n.adoptHigherTerm(request.Term); err != nil {
+			return err
+		}
+	}
+	response := InstallSnapshotResponse{Term: n.term, RequestID: request.RequestID}
+	if request.Term < n.term || request.LeaderID != message.From {
+		n.sendSnapshotResponse(message.From, response)
+		return nil
+	}
+	n.becomeFollowerSameTerm()
+	n.leaderID = request.LeaderID
+	n.resetElectionDeadline(now)
+	if request.LastIncludedIndex <= n.snapshot.LastIncludedIndex {
+		response.Success = true
+		response.MatchIndex = n.snapshot.LastIncludedIndex
+		n.sendSnapshotResponse(message.From, response)
+		return nil
+	}
+	if len(request.Data) > n.maxSnapshotBytes {
+		return fmt.Errorf("%w: %d > %d bytes", ErrSnapshotTooLarge, len(request.Data), n.maxSnapshotBytes)
+	}
+	if n.stateMachine == nil {
+		return fmt.Errorf("install snapshot requires a state machine")
+	}
+	if err := n.stateMachine.ValidateSnapshot(request.Data); err != nil {
+		return fmt.Errorf("validate installed snapshot: %w", err)
+	}
+
+	compatible := n.termAt(request.LastIncludedIndex) == request.LastIncludedTerm
+	if request.LastIncludedIndex < n.commitIndex && !compatible {
+		response.MatchIndex = n.snapshot.LastIncludedIndex
+		n.sendSnapshotResponse(message.From, response)
+		return nil
+	}
+	newLog := []Entry(nil)
+	if compatible {
+		newLog = cloneEntries(n.logFrom(request.LastIncludedIndex + 1))
+	}
+	newSnapshot := Snapshot{
+		LastIncludedIndex: request.LastIncludedIndex,
+		LastIncludedTerm:  request.LastIncludedTerm,
+		Data:              append([]byte(nil), request.Data...),
+	}
+	newCommit := max(n.commitIndex, request.LastIncludedIndex)
+	if newCommit > request.LastIncludedIndex+uint64(len(newLog)) {
+		response.MatchIndex = n.snapshot.LastIncludedIndex
+		n.sendSnapshotResponse(message.From, response)
+		return nil
+	}
+	state := n.persistentState()
+	state.Snapshot = newSnapshot
+	state.Log = newLog
+	state.CommitIndex = newCommit
+	if err := n.savePersistentState(state); err != nil {
+		return err
+	}
+	if err := n.stateMachine.RestoreSnapshot(newSnapshot.Data); err != nil {
+		n.storageErr = fmt.Errorf("restore installed snapshot after persistence: %w", err)
+		return n.storageErr
+	}
+	n.snapshot = newSnapshot
+	n.log = newLog
+	n.commitIndex = newCommit
+	n.lastApplied = newSnapshot.LastIncludedIndex
+	n.updateLastLog()
+	n.applyCommitted()
+	response.Success = true
+	response.MatchIndex = newSnapshot.LastIncludedIndex
+	n.sendSnapshotResponse(message.From, response)
+	return nil
+}
+
+func (n *Node) handleInstallSnapshotResponse(message Message) error {
+	response := message.InstallSnapshotResponse
+	if response.Term > n.term {
+		return n.adoptHigherTerm(response.Term)
+	}
+	if n.role != Leader || response.Term != n.term || !response.Success {
+		return nil
+	}
+	peer := message.From
+	if response.MatchIndex > n.matchIndex[peer] {
+		n.matchIndex[peer] = response.MatchIndex
+		n.nextIndex[peer] = response.MatchIndex + 1
+	}
+	n.sendAppend(peer)
+	return n.advanceCommit()
+}
+
 func (n *Node) becomeLeader(now time.Time) error {
 	n.cancelCurrentElection()
 	n.role = Leader
+	n.leaderID = n.id
 	n.votes = nil
 	n.leadershipCtx, n.cancelLeadership = context.WithCancel(context.Background())
 	n.nextIndex = make(map[NodeID]uint64, len(n.members))
 	n.matchIndex = make(map[NodeID]uint64, len(n.members))
 	n.lastRequest = make(map[NodeID]uint64, len(n.members))
 	for _, peer := range n.members {
-		n.nextIndex[peer] = uint64(len(n.log)) + 1
+		n.nextIndex[peer] = n.lastLogIndex() + 1
 	}
 	n.appendLocal(Command{Operation: OperationNoop})
 	if err := n.persist(); err != nil {
@@ -404,13 +577,14 @@ func (n *Node) adoptHigherTerm(term uint64) error {
 	n.cancelCurrentLeadership(Result{Error: ErrNotLeader.Error()})
 	n.term = term
 	n.role = Follower
+	n.leaderID = ""
 	n.votedFor = ""
 	n.votes = nil
 	return n.persist()
 }
 
 func (n *Node) appendLocal(command Command) Entry {
-	entry := Entry{Index: uint64(len(n.log)) + 1, Term: n.term, Command: command}
+	entry := Entry{Index: n.lastLogIndex() + 1, Term: n.term, Command: command}
 	n.log = append(n.log, entry)
 	n.lastLog = LogPosition{Index: entry.Index, Term: entry.Term}
 	if n.matchIndex != nil {
@@ -431,7 +605,11 @@ func (n *Node) replicateAll() {
 func (n *Node) sendAppend(peer NodeID) {
 	next := n.nextIndex[peer]
 	if next == 0 {
-		next = uint64(len(n.log)) + 1
+		next = n.lastLogIndex() + 1
+	}
+	if next <= n.snapshot.LastIncludedIndex {
+		n.sendSnapshot(peer)
+		return
 	}
 	prev := next - 1
 	n.requestSequence++
@@ -439,7 +617,7 @@ func (n *Node) sendAppend(peer NodeID) {
 	n.lastRequest[peer] = requestID
 	request := AppendEntriesRequest{
 		Term: n.term, LeaderID: n.id, PrevLogIndex: prev, PrevLogTerm: n.termAt(prev),
-		Entries: cloneEntries(n.log[prev:]), LeaderCommit: n.commitIndex, RequestID: requestID,
+		Entries: cloneEntries(n.logFrom(next)), LeaderCommit: n.commitIndex, RequestID: requestID,
 	}
 	ctx := n.leadershipCtx
 	if ctx == nil {
@@ -454,11 +632,34 @@ func (n *Node) sendAppendResponse(peer NodeID, response AppendEntriesResponse) {
 	})
 }
 
+func (n *Node) sendSnapshot(peer NodeID) {
+	n.requestSequence++
+	requestID := n.requestSequence
+	n.lastRequest[peer] = requestID
+	request := InstallSnapshotRequest{
+		Term: n.term, LeaderID: n.id,
+		LastIncludedIndex: n.snapshot.LastIncludedIndex,
+		LastIncludedTerm:  n.snapshot.LastIncludedTerm,
+		Data:              append([]byte(nil), n.snapshot.Data...), RequestID: requestID,
+	}
+	ctx := n.leadershipCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	_ = n.transport.Send(ctx, Message{From: n.id, To: peer, Type: MessageInstallSnapshot, InstallSnapshot: request})
+}
+
+func (n *Node) sendSnapshotResponse(peer NodeID, response InstallSnapshotResponse) {
+	_ = n.transport.Send(context.Background(), Message{
+		From: n.id, To: peer, Type: MessageInstallSnapshotResponse, InstallSnapshotResponse: response,
+	})
+}
+
 func (n *Node) advanceCommit() error {
 	if n.role != Leader {
 		return nil
 	}
-	for index := uint64(len(n.log)); index > n.commitIndex; index-- {
+	for index := n.lastLogIndex(); index > n.commitIndex; index-- {
 		if n.termAt(index) != n.term {
 			continue
 		}
@@ -484,7 +685,10 @@ func (n *Node) advanceCommit() error {
 func (n *Node) applyCommitted() {
 	for n.lastApplied < n.commitIndex {
 		n.lastApplied++
-		entry := n.log[n.lastApplied-1]
+		entry, ok := n.entryAt(n.lastApplied)
+		if !ok {
+			panic("raft: committed entry is unavailable after snapshot boundary")
+		}
 		result := Result{}
 		if n.stateMachine != nil {
 			result = n.stateMachine.Apply(entry)
@@ -535,11 +739,22 @@ func (n *Node) persist() error {
 	if n.store == nil {
 		return nil
 	}
-	state := PersistentState{
+	return n.savePersistentState(n.persistentState())
+}
+
+func (n *Node) persistentState() PersistentState {
+	return PersistentState{
 		CurrentTerm: n.term,
 		VotedFor:    n.votedFor,
 		Log:         cloneEntries(n.log),
 		CommitIndex: n.commitIndex,
+		Snapshot:    cloneSnapshot(n.snapshot),
+	}
+}
+
+func (n *Node) savePersistentState(state PersistentState) error {
+	if n.store == nil {
+		return nil
 	}
 	if err := n.store.Save(state); err != nil {
 		n.storageErr = fmt.Errorf("%w: %v", ErrStorageFault, err)
@@ -559,13 +774,20 @@ func (n *Node) resetElectionDeadline(now time.Time) {
 }
 
 func (n *Node) termAt(index uint64) uint64 {
-	if index == 0 || index > uint64(len(n.log)) {
+	if index == n.snapshot.LastIncludedIndex {
+		return n.snapshot.LastIncludedTerm
+	}
+	entry, ok := n.entryAt(index)
+	if !ok {
 		return 0
 	}
-	return n.log[index-1].Term
+	return entry.Term
 }
 
 func (n *Node) firstIndexOfTerm(term uint64) uint64 {
+	if n.snapshot.LastIncludedIndex > 0 && n.snapshot.LastIncludedTerm == term {
+		return n.snapshot.LastIncludedIndex
+	}
 	for _, entry := range n.log {
 		if entry.Term == term {
 			return entry.Index
@@ -585,11 +807,32 @@ func (n *Node) lastIndexOfTerm(term uint64) uint64 {
 
 func (n *Node) updateLastLog() {
 	if len(n.log) == 0 {
-		n.lastLog = LogPosition{}
+		n.lastLog = LogPosition{Index: n.snapshot.LastIncludedIndex, Term: n.snapshot.LastIncludedTerm}
 		return
 	}
 	last := n.log[len(n.log)-1]
 	n.lastLog = LogPosition{Index: last.Index, Term: last.Term}
+}
+
+func (n *Node) lastLogIndex() uint64 {
+	return n.snapshot.LastIncludedIndex + uint64(len(n.log))
+}
+
+func (n *Node) entryAt(index uint64) (Entry, bool) {
+	if index <= n.snapshot.LastIncludedIndex || index > n.lastLogIndex() {
+		return Entry{}, false
+	}
+	return n.log[index-n.snapshot.LastIncludedIndex-1], true
+}
+
+func (n *Node) logFrom(index uint64) []Entry {
+	if index <= n.snapshot.LastIncludedIndex {
+		return n.log
+	}
+	if index > n.lastLogIndex()+1 {
+		return nil
+	}
+	return n.log[index-n.snapshot.LastIncludedIndex-1:]
 }
 
 func isAtLeastAsUpToDate(candidate, local LogPosition) bool {
@@ -600,6 +843,11 @@ func isAtLeastAsUpToDate(candidate, local LogPosition) bool {
 }
 
 func cloneEntries(entries []Entry) []Entry { return append([]Entry(nil), entries...) }
+
+func cloneSnapshot(snapshot Snapshot) Snapshot {
+	snapshot.Data = append([]byte(nil), snapshot.Data...)
+	return snapshot
+}
 
 func copyProgress(source map[NodeID]uint64) map[NodeID]uint64 {
 	if source == nil {

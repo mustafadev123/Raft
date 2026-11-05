@@ -73,6 +73,15 @@ type Result struct {
 type StateMachine interface {
 	Apply(entry Entry) Result
 	CachedResult(clientID string, sequence uint64) (Result, bool)
+	Snapshot() ([]byte, error)
+	ValidateSnapshot(data []byte) error
+	RestoreSnapshot(data []byte) error
+}
+
+type Snapshot struct {
+	LastIncludedIndex uint64
+	LastIncludedTerm  uint64
+	Data              []byte
 }
 
 // PersistentState is the safety-critical state that must survive restart.
@@ -82,6 +91,7 @@ type PersistentState struct {
 	VotedFor    NodeID
 	Log         []Entry
 	CommitIndex uint64
+	Snapshot    Snapshot
 }
 
 // StableStore is implemented by the storage package. Save must not return nil
@@ -124,6 +134,22 @@ type AppendEntriesResponse struct {
 	RequestID     uint64
 }
 
+type InstallSnapshotRequest struct {
+	Term              uint64
+	LeaderID          NodeID
+	LastIncludedIndex uint64
+	LastIncludedTerm  uint64
+	Data              []byte
+	RequestID         uint64
+}
+
+type InstallSnapshotResponse struct {
+	Term       uint64
+	Success    bool
+	MatchIndex uint64
+	RequestID  uint64
+}
+
 type MessageType uint8
 
 const (
@@ -131,6 +157,8 @@ const (
 	MessageRequestVoteResponse
 	MessageAppendEntries
 	MessageAppendEntriesResponse
+	MessageInstallSnapshot
+	MessageInstallSnapshotResponse
 )
 
 // Message is the transport-neutral election envelope.
@@ -139,10 +167,12 @@ type Message struct {
 	To   NodeID
 	Type MessageType
 
-	RequestVote           RequestVoteRequest
-	RequestVoteResponse   RequestVoteResponse
-	AppendEntries         AppendEntriesRequest
-	AppendEntriesResponse AppendEntriesResponse
+	RequestVote             RequestVoteRequest
+	RequestVoteResponse     RequestVoteResponse
+	AppendEntries           AppendEntriesRequest
+	AppendEntriesResponse   AppendEntriesResponse
+	InstallSnapshot         InstallSnapshotRequest
+	InstallSnapshotResponse InstallSnapshotResponse
 }
 
 // Transport accepts outbound messages. Implementations must honor ctx: it is
@@ -185,6 +215,8 @@ type Config struct {
 	Store             StableStore
 	InitialTerm       uint64
 	InitialLog        []Entry
+	SnapshotThreshold uint64
+	MaxSnapshotBytes  int
 }
 
 var (
@@ -194,27 +226,31 @@ var (
 
 // State is a read-only snapshot intended for observation and tests.
 type State struct {
-	ID               NodeID
-	Role             Role
-	Term             uint64
-	VotedFor         NodeID
-	LastLog          LogPosition
-	Election         uint64
-	ElectionDeadline time.Time
-	HeartbeatDue     time.Time
-	Votes            int
-	CommitIndex      uint64
-	LastApplied      uint64
-	Log              []Entry
-	NextIndex        map[NodeID]uint64
-	MatchIndex       map[NodeID]uint64
+	ID                NodeID
+	Role              Role
+	Term              uint64
+	VotedFor          NodeID
+	LeaderID          NodeID
+	LastLog           LogPosition
+	Election          uint64
+	ElectionDeadline  time.Time
+	HeartbeatDue      time.Time
+	Votes             int
+	CommitIndex       uint64
+	LastApplied       uint64
+	Log               []Entry
+	NextIndex         map[NodeID]uint64
+	MatchIndex        map[NodeID]uint64
+	LastIncludedIndex uint64
+	LastIncludedTerm  uint64
 }
 
 var (
-	ErrNotLeader      = errors.New("not raft leader")
-	ErrInvalidCommand = errors.New("invalid client command")
-	ErrRequestPending = errors.New("a different request is already pending for this client")
-	ErrStorageFault   = errors.New("raft storage fault")
+	ErrNotLeader        = errors.New("not raft leader")
+	ErrInvalidCommand   = errors.New("invalid client command")
+	ErrRequestPending   = errors.New("a different request is already pending for this client")
+	ErrStorageFault     = errors.New("raft storage fault")
+	ErrSnapshotTooLarge = errors.New("snapshot exceeds configured size limit")
 )
 
 // Proposal completes only after its entry is committed and applied, or when

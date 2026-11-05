@@ -5,8 +5,8 @@ replicated key-value store in Go. The consensus algorithm will be implemented
 in this repository rather than delegated to an existing Raft library.
 
 > Status: Raft leader election, log replication, durable state/restart
-> recovery, and an in-memory key-value state machine are implemented and
-> deterministically tested. RPC adapters, snapshots, and full system testing
+> recovery, an in-memory key-value state machine, and gRPC peer/client
+> networking are implemented and tested. Snapshots and production hardening
 > remain planned.
 
 ## Scope
@@ -73,29 +73,57 @@ protoc-gen-go --version
 protoc-gen-go-grpc --version
 ```
 
-## Current checks
-
-Once Go is installed, the stage-one skeleton should be checked with:
+## Checks
 
 ```powershell
 go fmt ./...
 go vet ./...
-go test ./...
+go test ./... -count=1
 ```
 
-No generated code is checked in at this stage because no RPC schema or Raft
-implementation has been requested yet.
+## Protobuf generation
 
-## Planned stages
+```powershell
+protoc --go_out=. --go_opt=paths=source_relative `
+  --go-grpc_out=. --go-grpc_opt=paths=source_relative `
+  api/raftkv/v1/raftkv.proto
+```
 
-1. Define Raft types and a deterministic single-node core with unit tests.
-2. Add election timers, RequestVote, and deterministic election tests.
-3. Add AppendEntries, conflict handling, commit rules, and replication tests.
-4. Add durable storage and crash recovery.
-5. Define protobuf APIs and implement gRPC peer transport.
-6. Add the KV state machine and client-facing `Put`, `Get`, and `Delete` RPCs.
-7. Add snapshots and log compaction.
-8. Add deterministic three-node/five-node failure tests and a local demo.
+The current generated files use `protoc` 36.2, `protoc-gen-go` 1.36.12, and
+`protoc-gen-go-grpc` 1.6.2. Runtime dependencies are gRPC-Go 1.85.0 and
+protobuf Go 1.36.12.
+
+## Local three-node demonstration
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/start-cluster.ps1
+bin/raftkvctl.exe -client-id demo -seq 1 put greeting hello
+bin/raftkvctl.exe -client-id demo -seq 2 get greeting
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/stop-cluster.ps1
+```
+
+Nodes bind to `127.0.0.1:7001` through `127.0.0.1:7003` by default and use
+separate directories below `tmp/local-cluster`. Run the complete leader
+failure and restart scenario with:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/integration.ps1
+```
+
+This is a local demonstration. It uses plaintext insecure gRPC credentials and
+has no authentication, authorization, TLS, hostile-input hardening, or
+production deployment support.
+
+## Client retries and timeouts
+
+`raftkvctl` reuses connections, follows leader hints, and retries transient
+failures until its overall deadline. Every retry preserves the same client ID
+and sequence number. Supply a stable `-client-id` and increase `-seq` by one
+for each completed operation.
+
+An RPC timeout is ambiguous: the command may have committed even though its
+response was lost. The CLI reports that the outcome is unknown and prints the
+identity that must be retried. A timeout does not prove that a write failed.
 
 Completed work is tracked separately in [`docs/progress.md`](docs/progress.md).
 

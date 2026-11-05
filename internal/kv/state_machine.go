@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 
@@ -23,6 +24,17 @@ type StateMachine struct {
 	maxClients     int
 	mutationCount  uint64
 	appliedIndices []uint64
+}
+
+type snapshotImage struct {
+	Values  map[string]string         `json:"values"`
+	Clients map[string]snapshotClient `json:"clients"`
+}
+
+type snapshotClient struct {
+	Sequence     uint64      `json:"sequence"`
+	Result       raft.Result `json:"result"`
+	AppliedIndex uint64      `json:"appliedIndex"`
 }
 
 func New(maxDeduplicationClients int) *StateMachine {
@@ -106,6 +118,63 @@ func (s *StateMachine) MutationCount() uint64 { return s.mutationCount }
 
 func (s *StateMachine) AppliedIndices() []uint64 {
 	return append([]uint64(nil), s.appliedIndices...)
+}
+
+func (s *StateMachine) Snapshot() ([]byte, error) {
+	image := snapshotImage{
+		Values:  make(map[string]string, len(s.values)),
+		Clients: make(map[string]snapshotClient, len(s.clients)),
+	}
+	for key, value := range s.values {
+		image.Values[key] = value
+	}
+	for id, record := range s.clients {
+		image.Clients[id] = snapshotClient{
+			Sequence: record.sequence, Result: record.result, AppliedIndex: record.appliedIndex,
+		}
+	}
+	return json.Marshal(image)
+}
+
+func (s *StateMachine) ValidateSnapshot(data []byte) error {
+	_, err := decodeSnapshot(data)
+	return err
+}
+
+func (s *StateMachine) RestoreSnapshot(data []byte) error {
+	image, err := decodeSnapshot(data)
+	if err != nil {
+		return err
+	}
+	values := make(map[string]string, len(image.Values))
+	for key, value := range image.Values {
+		values[key] = value
+	}
+	clients := make(map[string]clientRecord, len(image.Clients))
+	for id, record := range image.Clients {
+		clients[id] = clientRecord{sequence: record.Sequence, result: record.Result, appliedIndex: record.AppliedIndex}
+	}
+	s.values = values
+	s.clients = clients
+	s.mutationCount = 0
+	s.appliedIndices = nil
+	return nil
+}
+
+func decodeSnapshot(data []byte) (snapshotImage, error) {
+	var image snapshotImage
+	if err := json.Unmarshal(data, &image); err != nil {
+		return snapshotImage{}, fmt.Errorf("decode KV snapshot: %w", err)
+	}
+	if image.Values == nil || image.Clients == nil {
+		return snapshotImage{}, fmt.Errorf("decode KV snapshot: missing values or clients")
+	}
+	for id, record := range image.Clients {
+		if id == "" || record.Sequence == 0 {
+			return snapshotImage{}, fmt.Errorf("decode KV snapshot: invalid client record")
+		}
+	}
+	return image, nil
 }
 
 func (s *StateMachine) evictIfNeeded() {

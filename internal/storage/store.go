@@ -148,12 +148,22 @@ func (s *FileStore) inject(point CrashPoint) error {
 }
 
 func validate(state raft.PersistentState) error {
-	if state.CommitIndex > uint64(len(state.Log)) {
-		return fmt.Errorf("%w: commit index %d exceeds log length %d", ErrCorrupt, state.CommitIndex, len(state.Log))
+	snapshot := state.Snapshot
+	if snapshot.LastIncludedIndex == 0 {
+		if snapshot.LastIncludedTerm != 0 || len(snapshot.Data) != 0 {
+			return fmt.Errorf("%w: invalid empty snapshot boundary", ErrCorrupt)
+		}
+	} else if snapshot.LastIncludedTerm == 0 || snapshot.LastIncludedTerm > state.CurrentTerm || len(snapshot.Data) == 0 {
+		return fmt.Errorf("%w: invalid snapshot boundary", ErrCorrupt)
+	}
+	lastIndex := snapshot.LastIncludedIndex + uint64(len(state.Log))
+	if state.CommitIndex < snapshot.LastIncludedIndex || state.CommitIndex > lastIndex {
+		return fmt.Errorf("%w: commit index %d outside snapshot/log range %d..%d", ErrCorrupt, state.CommitIndex, snapshot.LastIncludedIndex, lastIndex)
 	}
 	for i, entry := range state.Log {
-		if entry.Index != uint64(i+1) {
-			return fmt.Errorf("%w: log index %d at position %d", ErrCorrupt, entry.Index, i+1)
+		wantIndex := snapshot.LastIncludedIndex + uint64(i) + 1
+		if entry.Index != wantIndex {
+			return fmt.Errorf("%w: log index %d at position %d", ErrCorrupt, entry.Index, wantIndex)
 		}
 		if entry.Term == 0 || entry.Term > state.CurrentTerm {
 			return fmt.Errorf("%w: invalid term %d at log index %d for current term %d", ErrCorrupt, entry.Term, entry.Index, state.CurrentTerm)

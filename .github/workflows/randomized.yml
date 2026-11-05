@@ -1,0 +1,27 @@
+name: Seeded randomized tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: Comma-separated signed 64-bit seeds
+        required: true
+        default: '101,202,303,404,505'
+
+permissions:
+  contents: read
+
+jobs:
+  randomized-five-node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache: true
+      - name: Five-node safety and recovery scenarios
+        env:
+          RAFTKV_RANDOMIZED: '1'
+          RAFTKV_SEEDS: ${{ inputs.seeds }}
+        run: go test ./internal/raft -run TestRandomizedFiveNodeSafetyAndRecovery -count=1 -v
